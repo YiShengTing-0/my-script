@@ -27458,7 +27458,7 @@ Are you sure you want to do this?
 			let nv = this._normNumeric(args.Value);
 
 			// 🚨 终极抢救：如果 _normNumeric 没兜住，我们就自己强行造！
-			如果（!（nv 是 NumberValue 类型）|| nv 为错误值）{
+			if (!(nv instanceof NumberValue) || nv.isError()) {
 				// 如果传进来的是个普通数字或字符串，我们强行通过 NumberValue 解析它！
 				const rawStr = (args.Value === undefined || args.Value === null) ? '' : String(args.Value).trim();
 				if (rawStr !== '') {
@@ -27467,7 +27467,7 @@ Are you sure you want to do this?
 			}
 
 			// 如果抢救失败，就真的是个坏数据了
-			如果（!（nv 是 NumberValue 类型）|| nv 为错误值）{
+			if (!(nv instanceof NumberValue) || nv.isError()) {
 				return JSON.stringify({
 					sign: 0,
 					numerator: "0",
@@ -27484,7 +27484,7 @@ Are you sure you want to do this?
 				numerator: String(nv.numerator),
 				denominator: String(nv.denominator),
 				from: nv.from || "integer",
-				当 decimal：nv.decimal 不为 null 且不为 undefined 时，返回 String(nv.decimal)；否则返回 null,
+				decimal: nv.decimal !== null && nv.decimal !== undefined ? String(nv.decimal) : null,
 				repetend: nv.repetend || ""
 			};
 
