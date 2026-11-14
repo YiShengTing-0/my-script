@@ -1182,6 +1182,7 @@
  *  Windows - 通用数据化弹窗系统 v1
  *  通过 window.Windows 暴露
  *  包含：Windows（设置面板）/ WindowMarkdown（文档窗口）
+ *        / PopupWindow（轻量单弹窗）/ ConsoleWindow（真·控制台）
  * ========================================================================= */
 (function () {
     'use strict';
@@ -1992,9 +1993,6 @@
             this.modal = null;
         }
 
-        // ─────────────────────────────────────────────────────────
-        //  内部：构建 DOM 骨架
-        // ─────────────────────────────────────────────────────────
         // ─────────────────────────────────────────────────────────
         //  内部：构建 DOM 骨架
         // ─────────────────────────────────────────────────────────
@@ -3575,6 +3573,799 @@
         }
     }
 
+
+    // ═══════════════════════════════════════════════════════════════
+    //  ConsoleWindow —— 可拖动、常驻、可清空、可保存历史的真·控制台
+    //  -------------------------------------------------------------------------
+    //  用法：
+    //    const MyConsole = new ConsoleWindow("__console__");
+    //    MyConsole
+    //      .clear()
+    //      .initialHistorys(["Hello", "World"])
+    //      .open();
+    //
+    //    MyConsole.print("Hello World!").refresh();
+    //    const history = MyConsole.history();       // 拿到历史，下次恢复用
+    //    MyConsole.close();                         // 关闭（只有 ✕ 才关）
+    //
+    //  特点：
+    //    - 可拖动（标题栏按住拖，有边界限制）
+    //    - 点击外部遮罩 **不会** 关闭（遮罩透明且不拦截）
+    //    - 只有点右上角 ✕ 才关
+    //    - 右上角还有一个 🗑️，点了就清空屏幕
+    //    - 打开后实例仍存在，随时 print / refresh
+    //    - history() 返回数组，方便你自己持久化到 localStorage / 存档
+    // ═══════════════════════════════════════════════════════════════
+    const CONSOLE_STYLE_ID = 'console-window-styles-v4';
+
+    function injectConsoleStyles() {
+        if (document.getElementById(CONSOLE_STYLE_ID)) return;
+        const style = document.createElement('style');
+        style.id = CONSOLE_STYLE_ID;
+        style.textContent = `
+        /* ── 控制台遮罩（透明、不拦截、不关闭） ── */
+        .console-overlay {
+            position: fixed; inset: 0;
+            background: rgba(0, 0, 0, 0.3);          /* 稍微加深一点点，衬托窗口 */
+            z-index: 99998;
+            display: flex;
+            align-items: flex-start;
+            justify-content: flex-start;
+            pointer-events: none;                    /* ★ 点击穿透，不关闭 */
+            opacity: 0;
+            transition: opacity 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+            backdrop-filter: blur(0px);
+            will-change: opacity, backdrop-filter;
+        }
+        .console-overlay.console-open { 
+            opacity: 1; 
+        }
+        .console-overlay.console-closing { 
+            opacity: 0; 
+            backdrop-filter: blur(0px);
+        }
+
+        /* ── 控制台窗口本体 ── */
+        .console-modal {
+            pointer-events: auto;
+            position: absolute;
+            left: 80px; top: 80px;
+            width: 720px;
+            max-width: 92vw;
+            height: 460px;
+            max-height: 80vh;
+            background: #1a1a2e;                     /* 🎨 对齐设置面板主体颜色 */
+            color: #cdd6f4;                          /* 🎨 对齐文字颜色 */
+            border: 1px solid #313244;               /* 🎨 对齐边框颜色 */
+            border-radius: 16px;                     /* 🎨 更大的圆角，更优雅 */
+            box-shadow: 0 40px 120px rgba(0, 0, 0, 0.85); /* 🎨 对齐阴影 */
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif; /* 🎨 对齐 UI 字体 */
+            transform: scale(0.96) translateY(20px);
+            opacity: 0;
+            transition:
+                transform 0.42s cubic-bezier(0.22, 1, 0.36, 1),
+                opacity 0.32s cubic-bezier(0.22, 1, 0.36, 1);
+            will-change: transform, opacity;
+        }
+        .console-overlay.console-open .console-modal {
+            transform: scale(1) translateY(0);
+            opacity: 1;
+        }
+        .console-overlay.console-closing .console-modal {
+            transform: scale(0.96) translateY(20px);
+            opacity: 0;
+        }
+        .console-modal.console-dragging {
+            transition: none;                        /* 拖动时不要动画 */
+            box-shadow: 0 40px 120px rgba(0, 0, 0, 0.95); /* 拖动时阴影加深，更有悬浮感 */
+        }
+
+        /* ── 标题栏（拖动把手） ── */
+        .console-header {
+            padding: 16px 24px;                      /* 🎨 对齐设置面板的内边距 */
+            background: #1c1c2e;                     /* 🎨 对齐头部颜色 */
+            border-bottom: 1px solid #2a2a3e;        /* 🎨 对齐头部边框 */
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-shrink: 0;
+            cursor: grab;
+            user-select: none;
+        }
+        .console-modal.console-dragging .console-header {
+            cursor: grabbing;
+        }
+        .console-title {
+            font-size: 16px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            color: #89b4fa;                          /* 🎨 优雅的主题蓝 */
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .console-title::before {
+            content: '●';
+            color: #a6e3a1;                          /* 🎨 柔和的绿色小圆点 */
+            text-shadow: 0 0 12px rgba(166, 227, 161, 0.5);
+            animation: consolePulse 2s ease-in-out infinite;
+        }
+        @keyframes consolePulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.9); }
+        }
+        .console-title-text {
+            color: #cdd6f4;
+        }
+        .console-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .console-btn {
+            background: rgba(255, 255, 255, 0.03);
+            border: none;
+            color: #6c7086;
+            cursor: pointer;
+            font-size: 16px;
+            line-height: 1.4;
+            padding: 4px 12px;
+            border-radius: 8px;
+            transition: color 0.25s ease, background 0.25s ease, transform 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+            font-family: inherit;
+        }
+        .console-btn:hover {
+            background: rgba(255, 255, 255, 0.08);
+            color: #cdd6f4;
+        }
+        /* 🗑️ 悬停变黄 */
+        .console-btn.console-btn-clear:hover {
+            color: #f9e2af;
+            background: rgba(249, 226, 175, 0.15);
+            transform: scale(1.08) rotate(-10deg);
+        }
+        /* ✕ 悬停变红（顺便转个圈，跟 Windows 一样） */
+        .console-btn.console-btn-close:hover {
+            color: #f38ba8;
+            background: rgba(243, 139, 168, 0.15);
+            transform: rotate(90deg) scale(1.05);
+        }
+        .console-btn:active {
+            transform: scale(0.9) !important;
+        }
+
+        /* ── 控制台主体 ── */
+        .console-body {
+            flex: 1;
+            overflow-y: auto;
+            padding: 16px 24px;
+            font-family: "JetBrains Mono", "Consolas", "Monaco", monospace; /* 代码块保留等宽 */
+            font-size: 13.5px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+            scroll-behavior: smooth;
+        }
+        .console-body::-webkit-scrollbar { width: 6px; }
+        .console-body::-webkit-scrollbar-track { background: transparent; }
+        .console-body::-webkit-scrollbar-thumb {
+            background: #313244;                     /* 🎨 对齐滚动条颜色 */
+            border-radius: 10px;
+            transition: background 0.3s ease;
+        }
+        .console-body::-webkit-scrollbar-thumb:hover { background: #45475a; }
+
+        /* ── 每一条 ── */
+        .console-line {
+            display: flex;
+            gap: 16px;
+            padding: 4px 0;
+            border-bottom: 1px solid rgba(42, 42, 62, 0.3); /* 🎨 极淡的分割线，增加阅读舒适度 */
+            animation: consoleLineIn 0.3s cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+        .console-line:last-child {
+            border-bottom: none;
+        }
+        @keyframes consoleLineIn {
+            from { opacity: 0; transform: translateY(6px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .console-time {
+            color: #6c7086;                          /* 🎨 柔和的灰色时间戳 */
+            font-size: 12px;
+            flex-shrink: 0;
+            min-width: 64px;
+            padding-top: 2px;
+            user-select: none;
+        }
+        .console-msg {
+            flex: 1;
+            white-space: pre-wrap;
+            word-break: break-word;
+            color: #cdd6f4;
+        }
+
+        /* 空状态 */
+        .console-empty {
+            color: #6c7086;
+            font-style: italic;
+            padding: 40px 0;
+            text-align: center;
+            user-select: none;
+            font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+        }
+
+        /* 消息级别颜色（对齐 Catppuccin 调色板） */
+        .console-line[data-level="error"] .console-msg   { color: #f38ba8; }
+        .console-line[data-level="warn"] .console-msg    { color: #f9e2af; }
+        .console-line[data-level="info"] .console-msg    { color: #89b4fa; }
+        .console-line[data-level="success"] .console-msg { color: #a6e3a1; }
+        .console-line[data-level="debug"] .console-msg   { color: #cba6f7; }
+
+        /* ── 底部状态栏 ── */
+        .console-footer {
+            padding: 12px 24px;
+            background: #1c1c2e;                     /* 🎨 对齐底部颜色 */
+            border-top: 1px solid #2a2a3e;
+            font-size: 12px;
+            color: #6c7086;
+            display: flex;
+            justify-content: space-between;
+            flex-shrink: 0;
+            user-select: none;
+            font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+        }
+
+        @media (prefers-reduced-motion: reduce) {
+            .console-overlay, .console-modal, .console-line, .console-title::before {
+                animation: none !important;
+                transition-duration: 0.01ms !important;
+            }
+        }
+        `;
+        document.head.appendChild(style);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    //  工具
+    // ═══════════════════════════════════════════════════════════
+    const pad2 = (n) => (n < 10 ? '0' + n : String(n));
+    const formatTime = (date) => {
+        const d = date || new Date();
+        return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+    };
+
+    // ═══════════════════════════════════════════════════════════
+    //  ConsoleWindow
+    // ═══════════════════════════════════════════════════════════
+    class ConsoleWindow {
+        /**
+         * @param {string} [id] 窗口标识（多实例并存时用于区分）
+         */
+        constructor(id) {
+            injectConsoleStyles();
+
+            this.id = id || ('console-' + Date.now());
+
+            // ── 数据 ──
+            this._lines = [];          // 纯文本数组（对外 history 用的“简版”）
+            this._records = [];        // { time, message, level }（内部渲染用）
+            this._maxLines = 5000;     // 防爆上限
+            this._titleText = 'Console';
+			this._empty = "空~"
+
+            // ── 状态 ──
+            this._built = false;
+            this._closing = false;
+            this._opened = false;
+
+            // ── 拖动 ──
+            this._dragState = null;
+
+            // ── 位置记忆 ──
+            this._pos = { left: 80, top: 80 };
+            this._pendingColor = null;
+        }
+
+        // ─────────────────────────────────────────────────────
+        //  链式 API
+        // ─────────────────────────────────────────────────────
+
+        /**
+         * 清空所有记录（屏幕 + 内存）
+         */
+        clear() {
+            this._lines = [];
+            this._records = [];
+            if (this.bodyEl) this._renderAll();
+            return this;
+        }
+
+        /**
+         * 从上次记录恢复（字符串数组）
+         * 注意：恢复的内容不区分 level，统一当成普通输出
+         */
+        /**
+         * 从上次记录恢复（支持纯字符串，也支持 {time, message, level, color} 字典列表）
+         */
+        initialHistorys(arr) {
+            if (!Array.isArray(arr)) return this;
+            this._lines = [];
+            this._records = [];
+            for (const item of arr) {
+                if (item == null) continue;
+                
+                if (typeof item === 'string') {
+                    this._records.push({
+                        time: formatTime(),
+                        message: item,
+                        level: 'log',
+                        color: null, // 🌟 默认无颜色
+                    });
+                    this._lines.push(item);
+                } else if (typeof item === 'object') {
+                    const msg = item.message == null ? '' : String(item.message);
+                    
+                    // 🌟 核心：把你写的 color 吃进去，顺便给 level 做个兜底！
+                    this._records.push({
+                        time: item.time || formatTime(),
+                        message: msg,
+                        level: item.level || 'log', // 👈 没写 level？自动补 'log'
+                        color: item.color || null,  // 👈 没写 color？自动补 null（默认色）
+                    });
+                    this._lines.push(msg);
+                }
+            }
+            this._trim();
+            if (this.bodyEl) this._renderAll();
+            return this;
+        }
+        /**
+         * 追加一条输出（不自动刷新，需要链式 .refresh()）
+         */
+        print(message, level) {
+            const msg = (message === undefined || message === null) ? '' : String(message);
+            const lv = level || 'log';
+            
+            // 🌟 检查有没有挂着颜色
+            const color = this._pendingColor || null;
+            
+            this._records.push({ 
+                time: formatTime(), 
+                message: msg, 
+                level: lv,
+                color: color // 🌟 存下颜色
+            });
+            this._lines.push(msg);
+            this._trim();
+            return this;
+        }
+
+		/**
+         * 🌟 给最新的一句话上色（仅生效一次，refresh 后自动重置）
+         * @param {string} color 十六进制颜色，如 "#FF0000" / "#f38ba8"
+         */
+        setColor(color) {
+            if (color && typeof color === 'string') {
+                // 用浏览器原生的 CSS.supports 做个容错校验
+                // 如果支持这个颜色就存下来，不支持或者乱填，就忽略
+                if (window.CSS && CSS.supports && CSS.supports('color', color)) {
+                    this._pendingColor = color;
+                } else {
+                    console.warn(`[ConsoleWindow] 无效的颜色: ${color}，已忽略。`);
+                }
+            }
+            return this;
+        }
+
+		setEmptyText(text) {
+			this._empty = text;
+			return this
+		}
+
+		/**
+         * 🌟 设置控制台标题
+         * @param {string} title 标题文本
+         */
+        setTitle(title) {
+            this._titleText = String(title ?? 'Console');
+            
+            // 如果当前已经打开了窗口，实时更新 DOM
+            if (this.headerEl) {
+                const titleEl = this.headerEl.querySelector('.console-title-text');
+                if (titleEl) {
+                    titleEl.textContent = this._titleText;
+                }
+            }
+            return this;
+        }
+
+        /** 快捷：info */
+        info(message) { return this.print(message, 'info'); }
+        /** 快捷：warn */
+        warn(message) { return this.print(message, 'warn'); }
+        /** 快捷：error */
+        error(message) { return this.print(message, 'error'); }
+        /** 快捷：success */
+        success(message) { return this.print(message, 'success'); }
+        /** 快捷：debug */
+        debug(message) { return this.print(message, 'debug'); }
+
+        /**
+         * 把内存里的内容刷新到屏幕
+         */
+        /**
+         * 把内存里的内容刷新到屏幕
+         */
+        refresh() {
+            if (this.bodyEl) {
+                this._renderAll();
+            }
+            // 🌟 刷完立刻重置上色笔！
+            this._pendingColor = null;
+            return this;
+        }
+
+        /**
+         * 获取历史记录（纯文本数组，方便你塞进 localStorage）
+         * @param {boolean} [withMeta] true 时返回 {time,message,level} 结构
+         */
+        history(withMeta = true) {
+            if (withMeta === false) {
+                return this._lines.slice(); // 只要文字
+            }
+            // 🌟 默认返回带时间戳、带级别的完整数据！
+            return this._records.slice(); 
+        }
+
+        /**
+         * 打开控制台
+         */
+        open() {
+            if (this._built) {
+                this._bringToFront();
+                this.refresh();
+                return this;
+            }
+            this._closing = false;
+            this._build();
+            this._bind();
+            this._openAnimate();
+            this._opened = true;
+            this.refresh();
+            return this;
+        }
+
+        /**
+         * 关闭控制台（只有点 ✕ 才会走到这里）
+         */
+        close() {
+            if (!this._built || this._closing) return this;
+            this._closing = true;
+            if (this.overlay) {
+                this.overlay.classList.remove('console-open');
+                this.overlay.classList.add('console-closing');
+            }
+            const finish = () => {
+                if (this.overlay && this.overlay.parentNode) {
+                    this.overlay.parentNode.removeChild(this.overlay);
+                }
+                this.overlay = null;
+                this.modal = null;
+                this.headerEl = null;
+                this.bodyEl = null;
+                this.footerEl = null;
+                this._built = false;
+                this._opened = false;
+                this._closing = false;
+                if (typeof this.onClose === 'function') {
+                    try { this.onClose(); } catch (e) {}
+                }
+            };
+            setTimeout(finish, 260);
+            return this;
+        }
+
+        /**
+         * 强制销毁（不触发 onClose）
+         */
+        destroy() {
+            if (this.overlay && this.overlay.parentNode) {
+                this.overlay.parentNode.removeChild(this.overlay);
+            }
+            this.overlay = null;
+            this.modal = null;
+            this.headerEl = null;
+            this.bodyEl = null;
+            this.footerEl = null;
+            this._built = false;
+            this._opened = false;
+            this._closing = false;
+            return this;
+        }
+
+        // ─────────────────────────────────────────────────────
+        //  状态查询
+        // ─────────────────────────────────────────────────────
+        isOpen() { return this._opened && this._built; }
+        get element() { return this.modal; }
+        get overlayElement() { return this.overlay; }
+
+        /** 设置关闭回调 */
+        setOnClose(fn) { this.onClose = fn; return this; }
+
+        /** 设置最大缓存行数 */
+        setMaxLines(n) {
+            const v = Number(n);
+            if (Number.isFinite(v) && v > 0) {
+                this._maxLines = Math.floor(v);
+                this._trim();
+                if (this.bodyEl) this.refresh();
+            }
+            return this;
+        }
+
+        /** 设置窗口尺寸 */
+        setSize(w, h) {
+            if (!this.modal) return this;
+            const wNum = Number(w), hNum = Number(h);
+            if (Number.isFinite(wNum) && wNum > 0) this.modal.style.width = wNum + 'px';
+            if (Number.isFinite(hNum) && hNum > 0) this.modal.style.height = hNum + 'px';
+            return this;
+        }
+
+        /** 设置窗口位置 */
+        setPosition(left, top) {
+            if (!this.modal) return this;
+            const l = Number(left), t = Number(top);
+            if (Number.isFinite(l)) { this.modal.style.left = l + 'px'; this._pos.left = l; }
+            if (Number.isFinite(t)) { this.modal.style.top = t + 'px'; this._pos.top = t; }
+            return this;
+        }
+
+        // ─────────────────────────────────────────────────────
+        //  内部：数据
+        // ─────────────────────────────────────────────────────
+        _trim() {
+            const max = this._maxLines;
+            if (this._records.length > max) {
+                const drop = this._records.length - max;
+                this._records.splice(0, drop);
+            }
+            if (this._lines.length > max) {
+                const drop = this._lines.length - max;
+                this._lines.splice(0, drop);
+            }
+        }
+
+        // ─────────────────────────────────────────────────────
+        //  内部：DOM
+        // ─────────────────────────────────────────────────────
+        _build() {
+            const overlay = document.createElement('div');
+            overlay.className = 'console-overlay';
+            overlay.dataset.consoleId = this.id;
+
+            const modal = document.createElement('div');
+            modal.className = 'console-modal';
+            modal.tabIndex = -1;
+            modal.style.left = this._pos.left + 'px';
+            modal.style.top = this._pos.top + 'px';
+
+            // ── 标题栏 ──
+            const header = document.createElement('div');
+            header.className = 'console-header';
+
+            const title = document.createElement('div');
+            title.className = 'console-title';
+            const titleText = document.createElement('span');
+            titleText.className = 'console-title-text';
+
+            titleText.textContent = this._titleText; 
+            
+            title.appendChild(titleText);
+
+            const actions = document.createElement('div');
+            actions.className = 'console-actions';
+
+            const clearBtn = document.createElement('button');
+            clearBtn.className = 'console-btn console-btn-clear';
+            clearBtn.title = '清空';
+            clearBtn.textContent = '🗑️';
+
+            const closeBtn = document.createElement('button');
+            closeBtn.className = 'console-btn console-btn-close';
+            closeBtn.title = '关闭';
+            closeBtn.textContent = '✕';
+
+            actions.append(clearBtn, closeBtn);
+            header.append(title, actions);
+
+            // ── 主体 ──
+            const body = document.createElement('div');
+            body.className = 'console-body';
+
+            // ── 底部 ──
+            const footer = document.createElement('div');
+            footer.className = 'console-footer';
+            const statusEl = document.createElement('span');
+            statusEl.className = 'console-status';
+            const countEl = document.createElement('span');
+            countEl.className = 'console-count';
+            footer.append(statusEl, countEl);
+
+            modal.append(header, body, footer);
+            overlay.appendChild(modal);
+
+            this.overlay = overlay;
+            this.modal = modal;
+            this.headerEl = header;
+            this.bodyEl = body;
+            this.footerEl = footer;
+            this.statusEl = statusEl;
+            this.countEl = countEl;
+
+            this._built = true;
+        }
+
+        _bind() {
+            const self = this;
+
+            // ── 🗑️ 清空 ──
+            this.headerEl.querySelector('.console-btn-clear').addEventListener('click', (e) => {
+                e.stopPropagation();
+                self.clear();
+            });
+
+            // ── ✕ 关闭 ──
+            this.headerEl.querySelector('.console-btn-close').addEventListener('click', (e) => {
+                e.stopPropagation();
+                self.close();
+            });
+
+            // ── 🖱️ 拖动（标题栏按住） ──
+            this.headerEl.addEventListener('mousedown', (e) => {
+                if (e.target.closest('.console-btn')) return;
+                if (e.button !== 0) return;
+
+                e.preventDefault();
+                const rect = self.modal.getBoundingClientRect();
+                self._dragState = {
+                    startX: e.clientX,
+                    startY: e.clientY,
+                    originLeft: rect.left,
+                    originTop: rect.top,
+                };
+                self.modal.classList.add('console-dragging');
+                self._bringToFront();
+
+                window.addEventListener('mousemove', onDragMove);
+                window.addEventListener('mouseup', onDragEnd);
+
+                function onDragMove(ev) {
+                    if (!self._dragState) return;
+                    const dx = ev.clientX - self._dragState.startX;
+                    const dy = ev.clientY - self._dragState.startY;
+                    let left = self._dragState.originLeft + dx;
+                    let top = self._dragState.originTop + dy;
+
+                    const vw = window.innerWidth;
+                    const vh = window.innerHeight;
+                    const w = self.modal.offsetWidth;
+                    const h = self.modal.offsetHeight;
+                    const minVisible = 40;
+
+                    left = Math.min(Math.max(left, minVisible - w), vw - minVisible);
+                    top = Math.min(Math.max(top, 0), vh - minVisible);
+
+                    self.modal.style.left = left + 'px';
+                    self.modal.style.top = top + 'px';
+                    self._pos.left = left;
+                    self._pos.top = top;
+                }
+
+                function onDragEnd() {
+                    if (self.modal) self.modal.classList.remove('console-dragging');
+                    self._dragState = null;
+                    window.removeEventListener('mousemove', onDragMove);
+                    window.removeEventListener('mouseup', onDragEnd);
+                }
+            });
+
+            // ── ⚠️ 遮罩不响应点击，阻止关闭 ──
+            this.overlay.addEventListener('mousedown', (e) => {
+                if (e.target === self.overlay) {
+                    e.stopPropagation();
+                    // 不关闭
+                }
+            });
+
+            // ── ESC 不关闭（符合“只有 ✕ 才关”的要求）──
+            // 如需 ESC 关闭，取消注释以下代码即可
+            // this._escHandler = (e) => {
+            //     if (e.key === 'Escape' && self.isOpen()) self.close();
+            // };
+            // document.addEventListener('keydown', this._escHandler);
+        }
+
+        _openAnimate() {
+            document.body.appendChild(this.overlay);
+            void this.overlay.offsetWidth;
+            this.overlay.classList.add('console-open');
+            setTimeout(() => {
+                if (this.modal) {
+                    try { this.modal.focus(); } catch (e) {}
+                }
+            }, 60);
+        }
+
+        _bringToFront() {
+            if (!this.overlay) return;
+            ConsoleWindow._zCounter = (ConsoleWindow._zCounter || 99998) + 1;
+            this.overlay.style.zIndex = String(ConsoleWindow._zCounter);
+        }
+
+        // ─────────────────────────────────────────────────────
+        //  内部：渲染
+        // ─────────────────────────────────────────────────────
+        _renderAll() {
+            const body = this.bodyEl;
+            if (!body) return;
+
+            body.innerHTML = '';
+
+            if (this._records.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'console-empty';
+                empty.textContent = this._empty;
+                body.appendChild(empty);
+                this._updateFooter();
+                return;
+            }
+
+            const frag = document.createDocumentFragment();
+            for (let i = 0; i < this._records.length; i++) {
+                frag.appendChild(this._renderLine(this._records[i]));
+            }
+            body.appendChild(frag);
+
+            body.scrollTop = body.scrollHeight;
+
+            this._updateFooter();
+        }
+
+        _renderLine(rec) {
+            const line = document.createElement('div');
+            line.className = 'console-line';
+            line.dataset.level = rec.level || 'log';
+
+            const timeEl = document.createElement('span');
+            timeEl.className = 'console-time';
+            timeEl.textContent = rec.time || '';
+
+            const msgEl = document.createElement('span');
+            msgEl.className = 'console-msg';
+            msgEl.textContent = rec.message;
+
+            line.append(timeEl, msgEl);
+            return line;
+        }
+
+        _updateFooter() {
+            if (this.countEl) {
+                this.countEl.textContent = this._records.length + ' line' + (this._records.length === 1 ? '' : 's');
+            }
+            if (this.statusEl) {
+                this.statusEl.textContent = this._opened ? '● Ready' : '○ Idle';
+            }
+        }
+    }
+
+    ConsoleWindow._zCounter = 99998;
+
     // ═══════════════════════════════════════════════════════════════
     //  静态方法：快捷创建
     // ═══════════════════════════════════════════════════════════════
@@ -3607,6 +4398,7 @@
     window.WindowMarkdown = WindowMarkdown;
 	window.PopupWindow = PopupWindow;
     window.WindowType = WindowType;
+    window.ConsoleWindow = ConsoleWindow;
 })();
 
 
@@ -3641,8 +4433,11 @@
 		PopupWindow,
 		WindowType,
 		DynamicArgumentType,
-		IconType
+		IconType,
+        ConsoleWindow,
 	} = window;
+
+	
 
 
     const choose = window.WindowsChoose;
@@ -3683,6 +4478,10 @@
 				zh: "📝 更新日志",
 				en: "📝 Change log"
 			},
+			"Console": {
+				zh: "💻 控制台",
+				en: "💻 Console",
+			},
 			"Save": {
 				zh: "✓ 保存设置",
 				en: "✓ Save setting"
@@ -3715,6 +4514,10 @@
 				zh: "数学扩展 · 更新日志",
 				en: "MathExtension · Change log",
 			},
+			"console": {
+				zh: "数学扩展 · 控制台",
+				en: "MathExtension · Console"
+			},
 			"Yes": {
 				zh: "确认",
 				en: "Yes"
@@ -3722,6 +4525,10 @@
 			"history": {
 				zh: "历史",
 				en: "History"
+			},
+			"Empty":{
+				zh: " ( 空 ) ",
+				en: " ( Empty ) "
 			},
 			"ClearCacheBtn": {
 				zh: "🧹 清空运算缓存",
@@ -7546,21 +8353,13 @@
 			【公式】NumberValue.fromJSON(JSON)
 			【参数】
 			【JSON】包含 sign / numerator / denominator 等底层属性的 JSON 字符串
-			【说明】
-			★ 专治各种“跨扩展传参变笨蛋”的毛病！
-			★ 即使对面扩展扒了你的底层数据转为 JSON，喂给这块积木就能“满血复活”。
-			★ 支持整数、小数、分数、循环小数，甚至无理数的截断还原。
-			★ 具有较强的容错能力，前后有多余字符也能强行把 {} 里的内容抠出来解析。`,
+			`,
 					en: `【Name】From JSON to number
 			【Do】Receives a JSON string containing underlying math data and perfectly restores it to a high-precision NumberValue.
 			【Formula】NumberValue.fromJSON(JSON)
 			【Argument】
 			【JSON】JSON string containing underlying properties like sign / numerator / denominator, etc.
-			【Note】
-			★ Specially cures the "parameter becomes dumb" syndrome across extensions!
-			★ Even if another extension strips your underlying data into JSON, feed it to this block to revive it.
-			★ Supports integers, decimals, fractions, repeating decimals, and even irrational numbers.
-			★ Highly fault-tolerant; it can forcefully extract and parse the content inside {} even with extra characters.`
+			`
 				}
 			},
 			"ToJSON": {
@@ -7574,19 +8373,13 @@
 			【公式】JSON.stringify(NumberValue)
 			【参数】
 			【Value】任意数字（支持 NumberValue、分数、循环小数、普通数字等）
-			【说明】
-			★ 专用于跨扩展的底层数据通讯！
-			★ 如果你需要把高精度数据发给别的扩展，但又怕它们不认识，用这个积木转成文本 JSON 即可！
-			★ 结合「从底层 JSON 生成数字」积木，可以实现无损存档和互相转换。`,
+			`,
 					en: `【Name】Convert to underlying JSON
 			【Do】Strips off the high-tech disguise of a number, exposing its most underlying properties (sign, numerator, denominator, type, decimal string, repetend) as a JSON string.
 			【Formula】JSON.stringify(NumberValue)
 			【Argument】
 			【Value】Any number (supports NumberValue, fraction, repeating decimal, regular number, etc.)
-			【Note】
-			★ Specially designed for underlying data communication across extensions!
-			★ If you need to send high-precision data to another extension but are afraid they won't understand it, use this block to convert it to a JSON text!
-			★ Combined with the "From JSON to number" block, you can achieve lossless saving and mutual conversion.`
+			`
 				}
 			},
 		},
@@ -7812,6 +8605,10 @@ Are you sure you want to do this?
 			"ReturnError": {
 				zh: "返回错误",
 				en: "Return Error"
+			},
+            "ConsoleError": { 
+				zh: "抛出错误到内置控制台", 
+				en: "Throw Error to Math console" 
 			},
 			"DecimalRound": {
 				zh: "四舍五入",
@@ -9388,21 +10185,47 @@ Are you sure you want to do this?
 	window.i18n = _translations;
 
     // ── 单一取词器 ──
-    const _pick = (id) => {
-        const v = _flat[id];
-        if (v === undefined) return undefined;
-        if (typeof v === "string") return v;
-        if (v.zh !== undefined) return v.zh;
-        if (v.en !== undefined) return v.en;
-        return undefined;
-    };
-    const _t = (id, fallback) => {
-        let v = _pick(id);
-        if (v === undefined) {
-            try { v = translate({ id: id }); } catch (e) { v = undefined; }
-        }
-        return (v === undefined || v === null) ? fallback : v;
-    };
+	const _pick = (id) => {
+		const v = _flat[id];
+		if (v === undefined) return undefined;
+		if (typeof v === "string") return v;
+		
+		// 不要盲目返回 zh！
+		// 根据 Scratch 当前语言返回对应版本！
+		const currentLang = Scratch.translate.currentLang || 'zh-cn';
+		if (currentLang.startsWith('zh')) {
+			return v.zh !== undefined ? v.zh : v.en;
+		} else {
+			return v.en !== undefined ? v.en : v.zh;
+		}
+	};
+	const _t = (id, fallback) => {
+		// 1. 先看是否有原生的 translate 函数可以调用
+		// 注意：Scratch.translate 会根据当前语言环境自动切换！
+		if (typeof translate === 'function') {
+			try {
+				const result = translate({ id: id });
+				// 如果引擎给了结果，且结果不等于 id 本身（说明翻译成功）
+				if (result && result !== id) {
+					return result;
+				}
+			} catch (e) {}
+		}
+
+		// 2. 如果引擎没给，再回退到本地 _pick
+		let v = _pick(id);
+		if (v !== undefined) {
+			// ⚠️ 注意：_pick 里面直接拿了 .zh！如果当前是英文，这就坏了！
+			// 所以我们优化 _pick，让它根据当前语言返回！
+			const currentLang = Scratch.translate.language || 'en'; 
+			if (v[currentLang]) return v[currentLang];
+			// 如果当前语言没找到，回退到中文
+			if (v.zh) return v.zh;
+			if (v.en) return v.en;
+		}
+
+		return fallback !== undefined ? fallback : id;
+	};
 
     // ── 分类取词 ──
     const lang      = (id) => _t("All." + id, id);
@@ -9428,6 +10251,9 @@ Are you sure you want to do this?
     const getMenu  = (id) => _t("Menus." + id, id);
     const getType  = (id) => _t("Type." + id, id);
     const getErrorFromOp = (id) => _t("OperatorErrors." + id, id);
+
+	
+    const MathConsole = new ConsoleWindow("__MathConsole__").setTitle(lang("console"));
 
 
 	const Docs = _t("Docs.docs");
@@ -9845,11 +10671,9 @@ Are you sure you want to do this?
 
 
 	function _handleError(errorId, bug = "", params = {}, thread) {
-		// ★★★ 最高优先级：Cmp 模式 → 静默 + 弹栈 ★★★
 		const currentThread = thread || (Mathmatics && Mathmatics._getCurrentThread && Mathmatics._getCurrentThread());
 		if (currentThread && currentThread.__mathCmpMode) {
 			currentThread.__mathHasError = true;
-			// ★ 手动弹栈到 try 块！
 			if (Mathmatics && Mathmatics._triggerCapture) {
 				Mathmatics._triggerCapture(currentThread, {
 					type: 'MathError',
@@ -9861,7 +10685,6 @@ Are you sure you want to do this?
 			return BLOCK_ERROR_SIGNAL;
 		}
 
-
 		const mode = _currentMode(thread);
 
 		// 如果是"运算符类错误"，走归一化
@@ -9869,12 +10692,21 @@ Are you sure you want to do this?
 		if (opId !== 'UnknownOperatorError' || /Error$/.test(String(errorId))) {
 			const norm = _normalizeOpError(errorId, bug, params, thread);
 			if (mode === 'false') return false;
-			if (mode === 'jsError') return norm.value;   // ★ 用 norm.value！
+			if (mode === 'jsError') return norm.value;
 			if (mode === 'throwError') {
 				Scratch.runtime.logSystem.error(norm.throwMessage);
 				throw new MathError(errorId, params, norm.throwMessage);
 			}
 			if (mode === 'returnError') return norm.value;
+			
+			// 🌟 控制台
+			if (mode === 'console') {
+				if (typeof MathConsole !== 'undefined') {
+					MathConsole.print(`[运算错误] ${norm.throwMessage}`, 'error').refresh();
+				}
+				return false;
+			}
+			
 			return false;
 		}
 
@@ -9895,6 +10727,15 @@ Are you sure you want to do this?
 			throw new MathError(errorId, params, message);
 		}
 		if (mode === "returnError") { return message; }
+		
+		// 🌟 控制台
+		if (mode === "console") {
+			if (typeof MathConsole !== 'undefined') {
+				MathConsole.print(` ${message}`, 'error').refresh();
+			}
+			return false;
+		}
+		
 		Scratch.runtime.logSystem.error(message);
 		return false;
 	}
@@ -9935,7 +10776,8 @@ Are you sure you want to do this?
 							{ text: getMenu("ReturnFalse"), value: "false" },
 							{ text: getMenu("ReturnJSError"), value: "jsError" },
 							{ text: getMenu("ThrowError"), value: "throwError" },
-							{ text: getMenu("ReturnError"), value: "returnError" }
+							{ text: getMenu("ReturnError"), value: "returnError" },
+                            { text: getMenu("ConsoleError"), value: "console" } // 🌟 新增！
 						];
 					}
 					
@@ -10010,7 +10852,8 @@ Are you sure you want to do this?
 				{ text: getMenu("ReturnFalse"), value: "false" },
 				{ text: getMenu("ReturnJSError"), value: "jsError" },
 				{ text: getMenu("ThrowError"), value: "throwError" },
-				{ text: getMenu("ReturnError"), value: "returnError" }
+				{ text: getMenu("ReturnError"), value: "returnError" },
+				{ text: getMenu("ConsoleError"), value: "console" } // 🌟 新增！
 			],
 			// 以后有新菜单在这里加
 		};
@@ -21201,6 +22044,14 @@ Are you sure you want to do this?
 						}
 					}
 				},
+				{
+                    opcode: 'openConsole',
+                    blockType: BlockType.BUTTON,
+                    text: lang("Console"),
+                    onClick: () => {
+                        MathConsole.setEmptyText(lang("Empty")).open();
+                    }
+                },
                 makeTag("All"),
                 {
                     opcode: "SetDecimal",
@@ -24990,7 +25841,8 @@ Are you sure you want to do this?
 							{ text: getMenu("ReturnFalse"), value: "false" },
 							{ text: getMenu("ReturnJSError"), value: "jsError" },
 							{ text: getMenu("ThrowError"), value: "throwError" },
-							{ text: getMenu("ReturnError"), value: "returnError" }
+							{ text: getMenu("ReturnError"), value: "returnError" },
+                            { text: getMenu("ConsoleError"), value: "console" }
 						]
 					},
 					TrigFuncMenu: {
@@ -25165,7 +26017,6 @@ Are you sure you want to do this?
 
 			if (mode === 'false') return false;
 			if (mode === 'jsError') {
-				// ★★★ JS 发癫模式！ ★★★
 				return _jsNativeResult(_normalizeOpErrorId(code), params);
 			}
 			if (mode === 'throwError') {
@@ -25177,6 +26028,18 @@ Are you sure you want to do this?
 				throw err;
 			}
 			if (mode === 'returnError') return fullMessage;
+			
+			// 🌟 新增：抛出到控制台！
+			if (mode === 'console') {
+				// 调用全局的 MathConsole，标红并自动刷新
+				if (typeof MathConsole !== 'undefined') {
+					MathConsole
+						.print(`${fullMessage}`, 'error')
+						.refresh();
+				}
+				return false; // 返回 false 让程序不崩溃，继续往下跑
+			}
+
 			return false;
 		}
 
@@ -25513,7 +26376,7 @@ Are you sure you want to do this?
 		HandleError(args, util) {
 			args = args || {};
 			const thread = util && util.thread;
-			const valid = ["false", "jsError", "throwError", "returnError"];
+			const valid = ["false", "jsError", "throwError", "returnError", "console"];
 			if (!valid.includes(args.Menu)) {
 				return _handleError("UnknownMenu", "NaN", { value: args.Menu });
 			}
@@ -26988,40 +27851,35 @@ Are you sure you want to do this?
 					params: { message },
 					message: message
 				});
-				return;   // COMMAND 积木无返回值
+				return;   
 			}
 			
-			// ★★★ 普通模式 → 按当前 HandleErrorMode 处理 ★★★
 			const mode = this._getCurrentSettings(thread).HandleErrorMode || 'throwError';
 			const fullMessage = lang('ErrorPrefix') + message;
 			
-			if (mode === 'false') {
-				// 静默，什么都不做
-				return;
-			}
-			if (mode === 'jsError') {
-				// JS 发癫模式 → 直接抛原生 Error！
-				throw new Error(message);
-			}
+			if (mode === 'false') return;
+			if (mode === 'jsError') throw new Error(message);
 			if (mode === 'throwError') {
-				// 抛出 MathError
-				try {
-					Scratch.runtime.logSystem.error(fullMessage);
-				} catch (e) {}
+				try { Scratch.runtime.logSystem.error(fullMessage); } catch (e) {}
 				const err = new MathError('ManualThrowError', { message }, fullMessage);
 				err.opId = 'ManualThrowError';
 				throw err;
 			}
-			if (mode === 'returnError') {
-				// COMMAND 积木没返回值，但可以记录到 runtime
-				// 用 throw 让 VM 感知，但会被 catch 后的行为处理
-				// 这里只能静默（因为没有返回值）
+			if (mode === 'returnError') return;
+			
+			// 🌟 新增：手动报错输出到控制台！
+			if (mode === 'console') {
+				if (typeof MathConsole !== 'undefined') {
+					MathConsole
+						.print(`${fullMessage}`, 'error')
+						.refresh();
+				}
 				return;
 			}
 			
-			// 兜底：默认抛出
 			throw new MathError('ManualThrowError', { message }, fullMessage);
 		}
+
 		IsValidValue(args, util) {
 			args = args || {};
 			const text = (args.text === undefined || args.text === null) ? '' : String(args.text).trim();
